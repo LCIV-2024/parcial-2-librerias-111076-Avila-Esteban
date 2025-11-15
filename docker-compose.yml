@@ -1,1 +1,6 @@
-# // TODO: Implementar el docker-compose
+services:
+  libreria:
+    build: .
+    container_name: libreria-app
+    ports:
+      - "8080:8080"

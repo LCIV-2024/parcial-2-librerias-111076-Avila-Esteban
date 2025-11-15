@@ -1,21 +1,26 @@
 package com.example.libreria.service;
 
+import com.example.libreria.dto.BookResponseDTO;
 import com.example.libreria.dto.ReservationRequestDTO;
 import com.example.libreria.dto.ReservationResponseDTO;
 import com.example.libreria.dto.ReturnBookRequestDTO;
+import com.example.libreria.dto.UserResponseDTO;
 import com.example.libreria.model.Book;
 import com.example.libreria.model.Reservation;
 import com.example.libreria.model.User;
 import com.example.libreria.repository.BookRepository;
 import com.example.libreria.repository.ReservationRepository;
+import com.example.libreria.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.modelmapper.ModelMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -30,39 +35,101 @@ public class ReservationService {
     private final BookRepository bookRepository;
     private final BookService bookService;
     private final UserService userService;
+    private final UserRepository userRepository;
+    private final ModelMapper modelMapper;
     
     @Transactional
     public ReservationResponseDTO createReservation(ReservationRequestDTO requestDTO) {
-
         // TODO: Implementar la creación de una reserva
-        // Validar que el usuario existe
-        
-        // Validar que el libro existe y está disponible
-        
-        // Crear la reserva
-        
-        // Reducir la cantidad disponible
+
+        try{
+            // Validar que el usuario existe
+            Long userId = requestDTO.getUserId();
+
+            UserResponseDTO user = userService.getUserById(userId);
+
+            if(user==null){
+                throw new RuntimeException("Usuario no encontrado con ID: " + userId);
+            }
+
+            // Validar que el libro existe y está disponible
+            BookResponseDTO book = bookService.getBookByExternalId(requestDTO.getBookExternalId());
+
+            if(book==null){
+                throw new RuntimeException("Libro no encontrado con ID externo: " + requestDTO.getBookExternalId());
+            }
+
+            if(book.getAvailableQuantity()<=0){
+                throw new RuntimeException("No hay copias disponibles del libro con ID externo: " + requestDTO.getBookExternalId());
+            }
+
+            Reservation reservation = new Reservation();
+            reservation.setUser(userRepository.findById(userId).get());
+            reservation.setBook(bookRepository.findByExternalId(book.getExternalId()).get());
+            reservation.setRentalDays(requestDTO.getRentalDays());
+            reservation.setDailyRate(book.getPrice());
+
+            BigDecimal totalFee = calculateTotalFee(
+                    reservation.getDailyRate(),
+                    reservation.getRentalDays()
+            );
+            reservation.setTotalFee(totalFee);
+
+            reservation.setStartDate(requestDTO.getStartDate());
+            reservation.setExpectedReturnDate(
+                    requestDTO.getStartDate().plusDays(requestDTO.getRentalDays())
+            );
+
+            // Crear la reserva
+            Reservation res = reservationRepository.save(reservation);
+
+            // Reducir la cantidad disponible
+            bookService.decreaseAvailableQuantity(book.getExternalId());
+
+            return modelMapper.map(res, ReservationResponseDTO.class);
+        }catch (Exception e){
+            throw new RuntimeException(e);
+        }
     }
-    
+
     @Transactional
     public ReservationResponseDTO returnBook(Long reservationId, ReturnBookRequestDTO returnRequest) {
 
-        // TODO: Implementar la devolución de un libro
         Reservation reservation = reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new RuntimeException("Reserva no encontrada con ID: " + reservationId));
-        
+
         if (reservation.getStatus() != Reservation.ReservationStatus.ACTIVE) {
             throw new RuntimeException("La reserva ya fue devuelta");
         }
-        
+
         LocalDate returnDate = returnRequest.getReturnDate();
+        if (returnDate == null) {
+            returnDate = LocalDate.now();
+        }
         reservation.setActualReturnDate(returnDate);
-        
-        // Calcular tarifa por demora si hay retraso
 
-        
+        LocalDate expectedDate = reservation.getExpectedReturnDate();
+        long daysLate = 0;
+        if (expectedDate != null && returnDate.isAfter(expectedDate)) {
+            daysLate = ChronoUnit.DAYS.between(expectedDate, returnDate);
+        }
+
+        // 15% del PRECIO DEL LIBRO por cada día de demora
+        BigDecimal lateFee = calculateLateFee(reservation.getBook().getPrice(), daysLate);
+        reservation.setLateFee(lateFee);
+
+        if (daysLate > 0) {
+            reservation.setStatus(Reservation.ReservationStatus.OVERDUE);
+        } else {
+            reservation.setStatus(Reservation.ReservationStatus.RETURNED);
+        }
+
+        Reservation saved = reservationRepository.save(reservation);
+
         // Aumentar la cantidad disponible
+        bookService.increaseAvailableQuantity(reservation.getBook().getExternalId());
 
+        return modelMapper.map(saved, ReservationResponseDTO.class);
     }
     
     @Transactional(readOnly = true)
@@ -101,12 +168,23 @@ public class ReservationService {
     }
     
     private BigDecimal calculateTotalFee(BigDecimal dailyRate, Integer rentalDays) {
-        // TODO: Implementar el cálculo del total de la reserva
+        if (dailyRate == null || rentalDays == null || rentalDays <= 0) {
+            return BigDecimal.ZERO;
+        }
+
+        return dailyRate.multiply(BigDecimal.valueOf(rentalDays));
     }
     
     private BigDecimal calculateLateFee(BigDecimal bookPrice, long daysLate) {
         // 15% del precio del libro por cada día de demora
         // TODO: Implementar el cálculo de la multa por demora
+
+        if (bookPrice == null || daysLate <= 0) {
+            return BigDecimal.ZERO;
+        }
+
+        BigDecimal dailyLateFee = bookPrice.multiply(new BigDecimal("0.15"));
+        return dailyLateFee.multiply(BigDecimal.valueOf(daysLate));
     }
     
     private ReservationResponseDTO convertToDTO(Reservation reservation) {
